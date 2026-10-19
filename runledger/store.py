@@ -35,6 +35,9 @@ def connect(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    if 'hash_version' not in {row['name'] for row in connection.execute('PRAGMA table_info(events)')}:
+        connection.execute('ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1')
+        connection.commit()
     return connection
 
 
@@ -46,12 +49,13 @@ def last_hash(connection: sqlite3.Connection) -> str:
 def append(connection: sqlite3.Connection, *, run_id: str, type_: str, at: str, actor: dict | None, payload: dict) -> dict:
     payload_text = canonical(payload)
     prev = last_hash(connection)
-    entry_hash = digest(prev, payload_text)
+    envelope = canonical({'run_id': run_id, 'type': type_, 'at': at,
+                          'actor_id': (actor or {}).get('id'), 'actor_role': (actor or {}).get('role'), 'payload': payload})
+    entry_hash = digest(prev, envelope)
     cursor = connection.execute(
-        "INSERT INTO events(run_id, type, at, actor_id, actor_role, payload, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO events(run_id, type, at, actor_id, actor_role, payload, prev_hash, hash, hash_version) VALUES (?,?,?,?,?,?,?,?,2)",
         (run_id, type_, at, (actor or {}).get("id"), (actor or {}).get("role"), payload_text, prev, entry_hash),
     )
-    connection.commit()
     return {"seq": cursor.lastrowid, "hash": entry_hash, "prev_hash": prev}
 
 
@@ -72,7 +76,14 @@ def verify_chain(connection: sqlite3.Connection) -> dict:
         count += 1
         if row["prev_hash"] != previous:
             problems.append(f"seq {row['seq']}: prev_hash mismatch")
-        expected = digest(row["prev_hash"], row["payload"])
+        text = row['payload']
+        if row['hash_version'] == 2:
+            try:
+                text = canonical({**{key: row[key] for key in ['run_id', 'type', 'at', 'actor_id', 'actor_role']},
+                                  'payload': json.loads(text)})
+            except json.JSONDecodeError:
+                pass
+        expected = digest(row["prev_hash"], text)
         if expected != row["hash"]:
             problems.append(f"seq {row['seq']}: hash mismatch")
         try:

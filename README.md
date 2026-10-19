@@ -1,107 +1,45 @@
-# Run ledger
+# Run Ledger
 
-An append-only ledger for agent runs: **decimal** cost accounting, a redacted diary, actor attribution and a review timeline — in one SQLite file and one self-contained HTML report.
+A local workbench for decimal agent-run accounting, a redacted diary and an attributed review timeline. Included records and model prices are synthetic.
 
 ```sh
+python -m pip install -e ".[dev]"
 runledger ingest fixtures/runs.jsonl --db ledger.db --prices fixtures/prices.json
 runledger report --db ledger.db --format html --out ledger.html
 runledger verify --db ledger.db
 ```
 
-![Summary](docs/preview.png)
+![Offline report](docs/preview.png)
 
-The sample data is **synthetic**. `example-fast` and `example-deep` are invented models with invented prices; no vendor price list, invoice or customer data is included.
+## Accounting rules
 
-## Why
+- Input tokens include cached tokens. Cached tokens cannot exceed input tokens.
+- Preserve raw Decimal costs. Round only after aggregation, to six decimal places with half-up rounding.
+- Keep currency balances separate. No exchange rate is assumed.
+- Missing model prices and null fee amounts produce incomplete totals, never an invented zero bill. Known subtotals remain visible.
+- Each call retains its price-table version. Example prices are not current vendor prices.
+- Record human effort only through explicit `human_time` events, with an actor and decimal-string `minutes`.
 
-Agent runs produce two things that are usually kept badly: **money** and **judgement**.
+## Diary and review
 
-- Costs are summed as floats, so invoices drift by cents and nobody can explain which call caused it.
-- A model that has no price is silently costed at zero.
-- Diary notes contain tokens, emails and local paths, so they cannot be shared or committed.
-- Reviews live in chat, detached from the run they approved.
+The JSONL event types are `run_start`, `llm_call`, `tool_call`, `diary`, `review`, `fee`, `human_time` and `run_end`. Diary, review and start events require an actor. Review decisions are `approved`, `rejected` or `changes_requested`.
 
-This ledger keeps those in one append-only place with explicit rules.
+Timestamps require a timezone and normalize to UTC. Text, actor names and nested metadata pass through pattern-based redaction before storage. Secret-valued metadata fields are replaced entirely. The HTML report is self-contained, escapes imported text and includes diary notes and review decisions. Review the export before sharing.
 
-## What is guaranteed
+A file import is atomic and repeated identical normalized events are skipped. The hash chain detects changes relative to the stored chain, including envelope edits in new version-2 rows. It does not attest event truth, prevent a complete rewrite or detect tail truncation without a trusted external checkpoint. Legacy rows protect payload only.
 
-| Property | Rule |
-| --- | --- |
-| Money | `Decimal` only. Floats are rejected at the boundary. Costs quantise to `0.000001` with `ROUND_HALF_UP`. |
-| Unknown prices | A model missing from the price table is stored as `unknown_price` with no amount. It is counted separately and never treated as zero. |
-| Price versions | Every call records the price table `version` and `currency` used at ingest time. |
-| Redaction | Keys, GitHub/AWS tokens, bearer tokens, emails, `C:\Users\…` and `/home/…` are replaced before storage. Counts are kept. |
-| Attribution | `run_start`, `diary` and `review` require an actor with `id`, `name` and one of `maintainer`, `reviewer`, `agent`, `observer`. |
-| Integrity | Every event is chained: `hash = SHA-256(prev_hash + canonical_payload)`. `verify` reports the first broken link. |
-| Idempotency | Re-ingesting the same file appends nothing; duplicates are counted. |
+## Formats
 
-The hash chain proves the **stored sequence was not edited after the fact**. It does not prove the events themselves are true.
-
-## Log format (JSONL)
-
-One JSON object per line. Unknown fields are rejected so typos fail loudly.
+See `fixtures/runs.jsonl` and `fixtures/prices.json` for complete examples. Price amounts are decimal strings and the schema is `PRICE_TABLE_V1`. Unknown fees use an explicit `amount: null` plus a currency. Reports expose `RUN_SUMMARY_V2`, with `totals.amounts` and each run's `amounts` keyed by currency. Each balance has `priced_subtotal`, `known_fees`, unknown counters and a nullable `total`.
 
 ```json
-{"type":"run_start","run_id":"run-001","at":"2026-10-18T09:00:00Z","actor":{"id":"ardhya","name":"Ardhya","role":"maintainer"},"task":"Add rounding test","metadata":{"branch":"feat/rounding"}}
-{"type":"llm_call","run_id":"run-001","at":"2026-10-18T09:00:05Z","model":"example-fast","input_tokens":1200,"output_tokens":400,"cached_tokens":200}
-{"type":"tool_call","run_id":"run-001","at":"2026-10-18T09:01:00Z","tool":"pytest","status":"ok","duration_ms":842}
-{"type":"diary","run_id":"run-001","at":"2026-10-18T09:02:00Z","actor":{"id":"ardhya","name":"Ardhya","role":"maintainer"},"text":"Checked auth with sk-…"}
-{"type":"review","run_id":"run-001","at":"2026-10-18T09:03:00Z","actor":{"id":"reviewer-1","name":"Reviewer","role":"reviewer"},"decision":"approved","note":"Ship it"}
-{"type":"fee","run_id":"run-001","at":"2026-10-18T09:04:00Z","amount":"0.42","currency":"USD","source":"invoice","note":"CI minutes"}
-{"type":"run_end","run_id":"run-001","at":"2026-10-18T09:05:00Z","status":"completed"}
+{"type":"human_time","run_id":"demo","at":"2026-10-19T09:00:00Z","actor":{"id":"reviewer","name":"Reviewer","role":"reviewer"},"minutes":"12.5","note":"Reviewed the synthetic fixture"}
 ```
 
-Decisions: `approved`, `rejected`, `changes_requested`. End states: `completed`, `failed`, `aborted`.
+## Verification and limits
 
-## Price table
+Run `python -m pytest -q`. The 19 tests cover the original workflow and six audit regressions: aggregation precision, currency separation, unknown fees, nested redaction, atomic ingestion, envelope tampering, explicit human effort and boundary validation. See [audit corrections](docs/AUDIT.md).
 
-```json
-{
-  "schema": "PRICE_TABLE_V1",
-  "version": "2026-10-example",
-  "currency": "USD",
-  "models": {
-    "example-fast": { "input_per_million": "1.50", "output_per_million": "6.00", "cached_input_per_million": "0.30" }
-  }
-}
-```
+Single local SQLite writer, no billing integration, automatic budget enforcement or claims of comprehensive secret detection. Event ordering is retained as imported; elapsed time does not imply human effort. Old ledgers retain previously rounded historical amounts. No historical values are silently repriced.
 
-Rates are strings. A model without an entry produces `unknown_price`; the report shows how many calls were unpriced and computes a priced subtotal only.
-
-## Report
-
-`--format text` for terminals, `json` for tooling, `html` for a shareable dashboard. The HTML is one file with no scripts and no external assets; text is escaped.
-
-## CLI
-
-```
-runledger ingest LOG... --db DB --prices PRICES
-runledger report --db DB [--format text|json|html] [--out FILE]
-runledger verify --db DB
-```
-
-Exit codes: `0` success, `1` broken chain, `2` invalid input.
-
-## Verification
-
-- 13 tests cover decimal rounding, cached-token pricing, unknown models, float rejection, redaction, actor roles, unknown fields, idempotency, tamper detection, HTML escaping and empty-ledger verification.
-- Fixture totals: run-001 = `0.055260 USD`, run-002 = `0.000000 USD` with one unknown-price call; fee `0.420000 USD`.
-- `verify` returns `ok: true` on an untouched ledger and reports a hash mismatch after a row is edited.
-
-## Limits
-
-- Single-writer SQLite; no concurrent ingest coordination beyond SQLite's own locking.
-- Redaction is pattern-based. It reduces accidental leaks; it is not a data-loss-prevention product.
-- The hash chain is not a signature: someone who can rewrite every row can rebuild the chain.
-- No budget enforcement or alerts; this is a ledger, not a billing system.
-- Timestamps are normalised to UTC but not validated against event order inside a run.
-- Synthetic prices and model names only; no vendor price feed is included.
-
-## Development
-
-```sh
-python -m pytest -q
-python -m runledger.cli ingest fixtures/runs.jsonl --db /tmp/ledger.db --prices fixtures/prices.json
-```
-
-MIT — see [LICENSE](LICENSE).
+MIT. See LICENSE.

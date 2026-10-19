@@ -30,7 +30,7 @@ def db(tmp_path) -> Path:
 
 def test_cost_uses_decimal_quantisation():
     assert cost(1_000_000, Decimal("1.50")) == Decimal("1.500000")
-    assert cost(1, Decimal("1.50")) == Decimal("0.000002")  # 0.0000015 rounds half up
+    assert cost(1, Decimal("1.50")) == Decimal("0.0000015")  # preserve precision until aggregation
     assert cost(0, Decimal("9.00")) == Decimal("0.000000")
 
 
@@ -79,12 +79,12 @@ def test_ingest_builds_summary(db, prices):
     first = next(run for run in summary["runs"] if run["run_id"] == "run-001")
     assert first["calls"] == 2
     assert first["unknown_calls"] == 0
-    assert Decimal(first["cost"]) == Decimal("0.055260")
+    assert Decimal(first["amounts"]["USD"]["priced_subtotal"]) == Decimal("0.055260")
     second = next(run for run in summary["runs"] if run["run_id"] == "run-002")
     assert second["unknown_calls"] == 1
-    assert second["cost"] == "0.000000"
+    assert second["amounts"]["USD"]["total"] is None
     assert summary["totals"]["unknown_calls"] == 1
-    assert summary["totals"]["fees"] == "0.420000"
+    assert summary["totals"]["amounts"]["USD"]["known_fees"] == "0.420000"
 
 
 def test_ingest_is_idempotent(db, prices):

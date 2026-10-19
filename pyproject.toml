@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "run-ledger"
-version = "0.1.0"
+version = "0.2.0"
 description = "Append-only agent run ledger with decimal cost accounting, redacted diary and review timeline."
 readme = "README.md"
 requires-python = ">=3.11"

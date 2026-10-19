@@ -22,7 +22,9 @@ ALLOWED = {
     "review": {"run_id", "type", "at", "actor", "decision", "note"},
     "run_end": {"run_id", "type", "at", "status"},
     "fee": {"run_id", "type", "at", "amount", "currency", "source", "note"},
+    "human_time": {"run_id", "type", "at", "actor", "minutes", "note"},
 }
+TYPES.add('human_time')
 
 
 class LogError(ValueError):
@@ -38,7 +40,7 @@ def parse_time(value) -> str:
     except ValueError as exc:
         raise LogError(f"invalid timestamp: {value}") from exc
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        raise LogError('timestamp must include a timezone')
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
@@ -125,6 +127,8 @@ def normalize(record: dict, prices: PriceTable) -> tuple[str, str, dict | None, 
             raise LogError("duration_ms must be a non-negative integer")
         payload = {"tool": tool[:80], "status": status, "duration_ms": duration}
     elif type_ == "diary":
+        if actor is None:
+            raise LogError('diary requires an actor')
         text, counts = redact_text(record.get("text"), "text")
         payload = {"actor": actor, "text": text, "redactions": counts}
         redactions = counts
@@ -144,23 +148,57 @@ def normalize(record: dict, prices: PriceTable) -> tuple[str, str, dict | None, 
         payload = {"status": status}
     elif type_ == "fee":
         try:
-            amount = as_decimal(record.get("amount"), "fee.amount")
+            amount = None if record.get('amount') is None else as_decimal(record['amount'], 'fee.amount')
         except MoneyError as exc:
             raise LogError(str(exc)) from exc
-        if amount < 0:
+        if amount is not None and amount < 0:
             raise LogError("fee.amount cannot be negative")
         currency = record.get("currency", "USD")
-        if not isinstance(currency, str) or len(currency) != 3:
+        if not isinstance(currency, str) or not re.fullmatch(r'[A-Z]{3}', currency):
             raise LogError("fee.currency must be a three-letter code")
         source = record.get("source", "invoice")
         if not isinstance(source, str) or not source:
             raise LogError("fee.source must be a non-empty string")
         note, counts = redact_text(record.get("note", ""), "note", 500)
         payload = {
-            "amount": str(amount.quantize(Decimal("0.000001"))), "currency": currency,
+            "amount": None if amount is None else str(amount), "currency": currency,
             "source": source[:80], "note": note,
         }
         redactions = counts
+    elif type_ == 'human_time':
+        if actor is None or actor['role'] == 'agent':
+            raise LogError('human_time requires an explicit human actor')
+        minutes = as_decimal(record.get('minutes'), 'minutes')
+        if minutes < 0:
+            raise LogError('minutes cannot be negative')
+        note, counts = redact_text(record.get('note', ''), 'note')
+        payload = {'actor': actor, 'minutes': str(minutes), 'note': note}
+        redactions = counts
+    # Scrub every free-text value, including nested metadata and actor names.
+    def scrub(value):
+        if isinstance(value, str):
+            result = redact(value)
+            for key, count in result.counts.items():
+                redactions[key] = redactions.get(key, 0) + count
+            return result.text
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, dict):
+            clean = {}
+            for key, item in value.items():
+                if key in {'redactions', 'redaction_counts'}:
+                    clean[key] = dict(item)
+                elif re.search(r'password|secret|api.?key|access.?token|authorization', key, re.I):
+                    clean[key] = '[REDACTED:secret_field]'
+                    redactions['secret_field'] = redactions.get('secret_field', 0) + 1
+                else:
+                    clean[scrub(key)] = scrub(item)
+            return clean
+        return value
+    payload = scrub(payload)
+    if actor is not None:
+        actor = payload.get('actor', actor)
+    payload['redaction_counts'] = dict(redactions)
     return run_id, type_, actor, payload, redactions
 
 
@@ -168,6 +206,7 @@ def ingest_file(path: Path, db_path: Path, prices: PriceTable) -> dict:
     connection = connect(str(db_path))
     stats = {"lines": 0, "appended": 0, "duplicates": 0, "redactions": {}, "unknown_price": 0, "runs": set()}
     try:
+        connection.execute('BEGIN IMMEDIATE')
         with path.open("r", encoding="utf-8") as handle:
             for number, line in enumerate(handle, 1):
                 if not line.strip():
@@ -188,6 +227,10 @@ def ingest_file(path: Path, db_path: Path, prices: PriceTable) -> dict:
                     stats["redactions"][key] = stats["redactions"].get(key, 0) + value
                 if type_ == "llm_call" and payload["price_status"] == "unknown_price":
                     stats["unknown_price"] += 1
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
     stats["runs"] = sorted(stats["runs"])
@@ -195,70 +238,87 @@ def ingest_file(path: Path, db_path: Path, prices: PriceTable) -> dict:
 
 
 def export_summary(db_path: Path) -> dict:
+    from .store import verify_chain
+    from decimal import ROUND_HALF_UP
     connection = connect(str(db_path))
     try:
+        integrity = verify_chain(connection)
+        if integrity["problems"]:
+            raise LogError("ledger integrity check failed")
         rows = connection.execute("SELECT * FROM events ORDER BY seq").fetchall()
     finally:
         connection.close()
-    runs: dict[str, dict] = {}
-    timeline = []
-    totals = {"cost": 0.0, "fees": 0.0, "unknown_calls": 0, "input_tokens": 0, "output_tokens": 0, "diary": 0, "reviews": 0}
-    from decimal import Decimal
-    cost_total = Decimal("0")
-    fee_total = Decimal("0")
+    runs, timeline = {}, []
+    def bucket():
+        return {"priced_subtotal": Decimal(0), "known_fees": Decimal(0), "unknown_calls": 0, "unknown_fees": 0}
+    balances = {}
+    human_minutes = Decimal(0)
     for row in rows:
         payload = json.loads(row["payload"])
         run = runs.setdefault(row["run_id"], {
             "run_id": row["run_id"], "actor": None, "task": None, "started_at": None,
             "ended_at": None, "status": None, "calls": 0, "input_tokens": 0,
-            "output_tokens": 0, "cost": Decimal("0"), "unknown_calls": 0,
-            "fees": Decimal("0"), "redactions": {}, "reviews": [], "tools": 0,
+            "output_tokens": 0, "unknown_calls": 0, "redactions": {}, "reviews": [],
+            "tools": 0, "amounts": {}, "human_minutes": Decimal(0), "diary": [],
         })
-        if row["type"] == "run_start":
-            run["actor"] = payload.get("actor")
-            run["task"] = payload.get("task")
-            run["started_at"] = row["at"]
-        elif row["type"] == "run_end":
-            run["ended_at"] = row["at"]
-            run["status"] = payload.get("status")
-        elif row["type"] == "llm_call":
-            run["calls"] += 1
-            run["input_tokens"] += payload["input_tokens"]
-            run["output_tokens"] += payload["output_tokens"]
-            totals["input_tokens"] += payload["input_tokens"]
-            totals["output_tokens"] += payload["output_tokens"]
-            if payload["amount"] is None:
-                run["unknown_calls"] += 1
-                totals["unknown_calls"] += 1
+        kind = row["type"]
+        if kind == "run_start":
+            run.update(actor=payload.get("actor"), task=payload.get("task"), started_at=row["at"])
+        elif kind == "run_end":
+            run.update(ended_at=row["at"], status=payload["status"])
+        elif kind in {"llm_call", "fee"}:
+            currency = payload["currency"]
+            local = run["amounts"].setdefault(currency, bucket())
+            global_ = balances.setdefault(currency, bucket())
+            if kind == "llm_call":
+                run["calls"] += 1
+                run["input_tokens"] += payload["input_tokens"]
+                run["output_tokens"] += payload["output_tokens"]
+            amount = payload["amount"]
+            if amount is None:
+                key = "unknown_calls" if kind == "llm_call" else "unknown_fees"
+                local[key] += 1
+                global_[key] += 1
+                if kind == "llm_call":
+                    run["unknown_calls"] += 1
             else:
-                value = Decimal(payload["amount"])
-                run["cost"] += value
-                cost_total += value
-        elif row["type"] == "fee":
-            value = Decimal(payload["amount"])
-            run["fees"] += value
-            fee_total += value
-        elif row["type"] == "tool_call":
+                key = "priced_subtotal" if kind == "llm_call" else "known_fees"
+                local[key] += Decimal(amount)
+                global_[key] += Decimal(amount)
+        elif kind == "human_time":
+            run["human_minutes"] += Decimal(payload["minutes"])
+            human_minutes += Decimal(payload["minutes"])
+        elif kind == "tool_call":
             run["tools"] += 1
-        elif row["type"] == "diary":
-            totals["diary"] += 1
-            for key, value in (payload.get("redactions") or {}).items():
-                run["redactions"][key] = run["redactions"].get(key, 0) + value
-        elif row["type"] == "review":
-            totals["reviews"] += 1
-            run["reviews"].append({"at": row["at"], "actor": payload.get("actor"), "decision": payload.get("decision"), "note": payload.get("note")})
-        timeline.append({"seq": row["seq"], "run_id": row["run_id"], "type": row["type"], "at": row["at"], "actor": row["actor_id"], "hash": row["hash"][:12]})
-    summary = {
-        "runs": list(runs.values()),
-        "totals": {
-            **totals,
-            "cost": str(cost_total.quantize(Decimal("0.000001"))),
-            "fees": str(fee_total.quantize(Decimal("0.000001"))),
-            "events": len(rows),
-        },
-        "timeline": timeline,
-    }
-    for run in summary["runs"]:
-        run["cost"] = str(run["cost"].quantize(Decimal("0.000001")))
-        run["fees"] = str(run["fees"].quantize(Decimal("0.000001")))
-    return summary
+        elif kind == "diary":
+            run["diary"].append({"at": row["at"], "actor": payload.get("actor"), "text": payload["text"]})
+        elif kind == "review":
+            run["reviews"].append({"at": row["at"], "actor": payload.get("actor"), "decision": payload["decision"], "note": payload.get("note")})
+        for key, value in payload.get("redaction_counts", payload.get("redactions", {})).items():
+            run["redactions"][key] = run["redactions"].get(key, 0) + value
+        timeline.append({"seq": row["seq"], "run_id": row["run_id"], "type": kind,
+                         "at": row["at"], "actor": payload.get("actor"),
+                         "text": payload.get("text", payload.get("note", "")),
+                         "decision": payload.get("decision"), "hash": row["hash"][:12]})
+    def finalize(amounts):
+        result = {}
+        for currency, values in sorted(amounts.items()):
+            result[currency] = {
+                "priced_subtotal": str(values["priced_subtotal"].quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+                "known_fees": str(values["known_fees"].quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+                "unknown_calls": values["unknown_calls"], "unknown_fees": values["unknown_fees"],
+                "total": None if values["unknown_calls"] or values["unknown_fees"] else str(
+                    (values["priced_subtotal"] + values["known_fees"]).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+            }
+        return result
+    totals = {"events": len(rows), "calls": sum(r["calls"] for r in runs.values()),
+              "input_tokens": sum(r["input_tokens"] for r in runs.values()),
+              "output_tokens": sum(r["output_tokens"] for r in runs.values()),
+              "unknown_calls": sum(r["unknown_calls"] for r in runs.values()),
+              "human_minutes": str(human_minutes), "amounts": finalize(balances)}
+    for run in runs.values():
+        run["amounts"] = finalize(run["amounts"])
+        run["human_minutes"] = str(run["human_minutes"])
+    return {"schema": "RUN_SUMMARY_V2", "runs": list(runs.values()), "totals": totals,
+            "timeline": timeline, "integrity": integrity,
+            "legacy_hash_rows": sum(row["hash_version"] == 1 for row in rows)}

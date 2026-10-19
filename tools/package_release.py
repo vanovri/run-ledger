@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ZIP_PATH = ROOT / "dist" / f"run-ledger-v{VERSION}.zip"
 SUMS_PATH = ROOT / "dist" / f"SHA256SUMS-v{VERSION}.txt"
 FIXED = (2026, 10, 19, 0, 0, 0)
@@ -16,7 +16,7 @@ FILES = [
     "fixtures/prices.json", "fixtures/runs.jsonl",
     "runledger/__init__.py", "runledger/cli.py", "runledger/ingest.py",
     "runledger/money.py", "runledger/redact.py", "runledger/report.py", "runledger/store.py",
-    "tests/test_runledger.py", "tools/package_release.py", "docs/preview.png",
+    "tests/test_runledger.py", "tests/test_audit_regressions.py", "docs/AUDIT.md", ".github/workflows/verify.yml", "tools/package_release.py", "docs/preview.png",
 ]
 
 

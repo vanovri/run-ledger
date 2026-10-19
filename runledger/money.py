@@ -40,8 +40,7 @@ def tokens(value, label: str) -> int:
 
 
 def cost(tokens_used: int, rate_per_million: Decimal) -> Decimal:
-    raw = Decimal(tokens_used) / Decimal(1_000_000) * rate_per_million
-    return raw.quantize(MICRO, rounding=ROUND_HALF_UP)
+    return Decimal(tokens(tokens_used, 'tokens')) / Decimal(1_000_000) * rate(rate_per_million, 'rate')
 
 
 def fmt(amount: Decimal | None, currency: str = "USD") -> str:
@@ -72,7 +71,7 @@ class PriceTable:
         if not isinstance(version, str) or not version.strip():
             raise MoneyError("price table needs a non-empty version")
         currency = payload.get("currency", "USD")
-        if not isinstance(currency, str) or len(currency) != 3:
+        if not isinstance(currency, str) or len(currency) != 3 or not currency.isascii() or not currency.isalpha() or currency != currency.upper():
             raise MoneyError("currency must be a three-letter code")
         models = {}
         for name, row in (payload.get("models") or {}).items():
@@ -90,10 +89,14 @@ class PriceTable:
         return cls(version=version, currency=currency, models=models)
 
     def quote(self, model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> Decimal | None:
+        for label, value in [('input_tokens', input_tokens), ('output_tokens', output_tokens), ('cached_tokens', cached_tokens)]:
+            tokens(value, label)
+        if cached_tokens > input_tokens:
+            raise MoneyError('cached_tokens cannot exceed input_tokens')
         price = self.models.get(model)
         if price is None:
             return None
-        cached = min(cached_tokens, input_tokens)
+        cached = cached_tokens
         uncached = input_tokens - cached
         cached_rate = price.cached_input_per_million if price.cached_input_per_million is not None else price.input_per_million
         return (
