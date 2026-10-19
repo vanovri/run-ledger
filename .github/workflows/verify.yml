@@ -1,0 +1,35 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install --upgrade pip pytest
+      - name: Tests
+        run: python -m pytest -q
+      - name: CLI smoke test
+        run: |
+          python -m runledger.cli ingest fixtures/runs.jsonl --db /tmp/ledger.db --prices fixtures/prices.json
+          python -m runledger.cli report --db /tmp/ledger.db --format html --out /tmp/ledger.html
+          python -m runledger.cli verify --db /tmp/ledger.db
+      - name: Package
+        run: python tools/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*

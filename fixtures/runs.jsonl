@@ -1,0 +1,11 @@
+{"type":"run_start","run_id":"run-001","at":"2026-10-18T09:00:00Z","actor":{"id":"ardhya","name":"Ardhya","role":"maintainer"},"task":"Add invoice rounding test for ardhya@example.com","metadata":{"branch":"feat/rounding"}}
+{"type":"llm_call","run_id":"run-001","at":"2026-10-18T09:00:05Z","model":"example-fast","input_tokens":1200,"output_tokens":400,"cached_tokens":200}
+{"type":"llm_call","run_id":"run-001","at":"2026-10-18T09:00:20Z","model":"example-deep","input_tokens":3000,"output_tokens":900}
+{"type":"tool_call","run_id":"run-001","at":"2026-10-18T09:01:00Z","tool":"pytest","status":"ok","duration_ms":842}
+{"type":"diary","run_id":"run-001","at":"2026-10-18T09:02:00Z","actor":{"id":"ardhya","name":"Ardhya","role":"maintainer"},"text":"Checked auth with sk-test1234567890abcdef and C:\\Users\\ardhya\\secret.txt"}
+{"type":"review","run_id":"run-001","at":"2026-10-18T09:03:00Z","actor":{"id":"reviewer-1","name":"Reviewer","role":"reviewer"},"decision":"approved","note":"Looks good; ping reviewer-1@example.com if tests flake."}
+{"type":"fee","run_id":"run-001","at":"2026-10-18T09:04:00Z","amount":"0.42","currency":"USD","source":"invoice","note":"CI minutes"}
+{"type":"run_end","run_id":"run-001","at":"2026-10-18T09:05:00Z","status":"completed"}
+{"type":"run_start","run_id":"run-002","at":"2026-10-18T10:00:00Z","actor":{"id":"agent-7","name":"Builder","role":"agent"},"task":"Try an unpriced model"}
+{"type":"llm_call","run_id":"run-002","at":"2026-10-18T10:00:10Z","model":"mystery-model","input_tokens":500,"output_tokens":100}
+{"type":"run_end","run_id":"run-002","at":"2026-10-18T10:01:00Z","status":"completed"}
